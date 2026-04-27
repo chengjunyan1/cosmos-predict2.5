@@ -16,25 +16,6 @@
 """Base model inference script."""
 
 import sys
-
-# Stub wandb before any cosmos_predict2 imports trigger its import chain.
-# The chain inference.py → guardrail → imaginaire/config.py → trainer.py
-# → callback.py does `import wandb` unconditionally, costing ~20s at startup.
-# Wandb is not used during inference.
-if "wandb" not in sys.modules:
-    import types as _types
-
-    class _WandbStub(_types.ModuleType):
-        def __getattr__(self, name: str):
-            return _WandbStub(f"wandb.{name}")
-        def __call__(self, *args, **kwargs):
-            return None
-        def __bool__(self):
-            return True
-
-    sys.modules["wandb"] = _WandbStub("wandb")
-    del _types, _WandbStub
-
 import json
 import os
 import tempfile
