@@ -15,6 +15,31 @@
 
 """Base model inference script."""
 
+import sys
+
+# Stub wandb before any cosmos_predict2 imports trigger its import chain.
+# The chain inference.py → guardrail → imaginaire/config.py → trainer.py
+# → callback.py does `import wandb` unconditionally, costing ~20s at startup.
+# Wandb is not used during inference.
+if "wandb" not in sys.modules:
+    import types as _types
+
+    class _WandbStub(_types.ModuleType):
+        def __getattr__(self, name: str):
+            return _WandbStub(f"wandb.{name}")
+        def __call__(self, *args, **kwargs):
+            return None
+        def __bool__(self):
+            return True
+
+    sys.modules["wandb"] = _WandbStub("wandb")
+    del _types, _WandbStub
+
+import json
+import os
+import tempfile
+import time
+import torch
 from pathlib import Path
 from typing import Annotated
 
@@ -33,9 +58,6 @@ from cosmos_predict2.config import (
 
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
-import sys,os
-import tempfile
-import json
 
 # setup from PAI benchmark paper
 # Model                 Version             #Frames     FPS     Width   Height
@@ -62,37 +84,98 @@ import json
 #  'video_id': 'misc_933704-uhd_3840_2160_30fps'}
 
 
+def _fast_hf_download(cmd_args: list[str]) -> str:
+    """Drop-in replacement for checkpoint_db._hf_download using the Python API.
+
+    The original shells out to `uvx hf download ...` twice per checkpoint — once
+    to fetch/verify and once with --quiet to retrieve the local path. The uvx
+    process startup + HF CLI verification adds 5-7s per call even on cache hits.
+    The Python huggingface_hub API resolves cached paths in milliseconds.
+
+    cmd_args is the argument list built by CheckpointFileHf / CheckpointDirHf:
+        [repo_id, "--repo-type", "model", "--revision", rev,
+         filename | --include pat... [--exclude pat...]]
+    """
+    from huggingface_hub import hf_hub_download, snapshot_download as hf_snapshot_download
+
+    repo_id = cmd_args[0]
+    revision: str | None = None
+    include_patterns: list[str] = []
+    exclude_patterns: list[str] = []
+    filename: str | None = None
+
+    i = 1
+    while i < len(cmd_args):
+        tok = cmd_args[i]
+        if tok == "--repo-type":
+            i += 2
+        elif tok == "--revision":
+            revision = cmd_args[i + 1]
+            i += 2
+        elif tok == "--include":
+            i += 1
+            while i < len(cmd_args) and not cmd_args[i].startswith("--"):
+                include_patterns.append(cmd_args[i])
+                i += 1
+        elif tok == "--exclude":
+            i += 1
+            while i < len(cmd_args) and not cmd_args[i].startswith("--"):
+                exclude_patterns.append(cmd_args[i])
+                i += 1
+        elif not tok.startswith("--"):
+            filename = tok
+            i += 1
+        else:
+            i += 1
+
+    if filename is not None:
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            repo_type="model",
+        )
+    else:
+        return hf_snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            repo_type="model",
+            allow_patterns=include_patterns or None,
+            ignore_patterns=exclude_patterns or None,
+        )
+
+
 class PAIGEvalMaker:
     def __init__(self):
         hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface/datasets"))
         self.cache_dir = os.path.join(hf_home, "pai-bench", "generation")
+        self._temp_files: list[str] = []
 
         # Check if we are running in a multi-GPU torchrun environment
         is_dist = dist.is_available() and dist.is_initialized()
-        
+
         # If distributed, force Ranks 1-7 to pause and wait here
         if is_dist and dist.get_rank() != 0:
             dist.barrier()
-            
+
         # Only Rank 0 (or a single-GPU run) performs the network downloads
         if not is_dist or dist.get_rank() == 0:
             snapshot_download(
                 repo_id="shi-labs/physical-ai-bench-generation",
                 repo_type="dataset",
                 allow_patterns="condition_image/*",
-                local_dir=self.cache_dir 
+                local_dir=self.cache_dir
             )
             self.ds = load_dataset("shi-labs/physical-ai-bench-generation")
-            
+
         # Rank 0 reaches this point and unlocks the barrier for Ranks 1-7
         if is_dist and dist.get_rank() == 0:
             dist.barrier()
-            
+
         # Ranks 1-7 resume and instantly load from the local disk cache
         if is_dist and dist.get_rank() != 0:
             self.ds = load_dataset("shi-labs/physical-ai-bench-generation")
 
-    
     @property
     def length(self):
         return len(self.ds['benchmark'])
@@ -107,7 +190,7 @@ class PAIGEvalMaker:
         image_name = row['image_name']
         image_path = os.path.join(self.image_dir, image_name)
         prompt = row['prompt_en']
-        
+
         json_data = {
             "inference_type": "image2world",
             "name": f"{video_id}__{seed}",
@@ -118,19 +201,40 @@ class PAIGEvalMaker:
             "prompt": prompt,
         }
         return json_data
-    
-    def get_cosmos_predict_json_file(self, index, seed=0):
+
+    def get_cosmos_predict_json_file(self, index, seed=0) -> Path:
         json_data = self.get_cosmos_predict_json(index, seed)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
-            temp_file.write(json.dumps(json_data).encode("utf-8"))
-            return Path(temp_file.name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as f:
+            f.write(json.dumps(json_data).encode("utf-8"))
+            self._temp_files.append(f.name)
+            return Path(f.name)
 
-    def get_cosmos_predict_json_files(self, indices, seed=0):
-        json_files = []
-        for index in indices:
-            json_files.append(self.get_cosmos_predict_json_file(index, seed))
-        return json_files
+    def get_cosmos_predict_json_files(self, indices, seed=0) -> list[Path]:
+        """Create temp JSON input files for the given indices.
 
+        Only rank 0 creates the files; other ranks receive the paths via broadcast
+        so all ranks share the same files without redundant I/O.
+        """
+        is_dist = dist.is_available() and dist.is_initialized()
+        paths: list[str | None] = [None] * len(indices)
+
+        if not is_dist or dist.get_rank() == 0:
+            for i, index in enumerate(indices):
+                paths[i] = str(self.get_cosmos_predict_json_file(index, seed))
+
+        if is_dist:
+            dist.broadcast_object_list(paths, src=0)
+
+        return [Path(p) for p in paths]  # type: ignore[arg-type]
+
+    def cleanup(self) -> None:
+        """Delete all temp files created by this instance."""
+        for path in self._temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._temp_files.clear()
 
 
 class Args(pydantic.BaseModel):
@@ -153,19 +257,68 @@ class Args(pydantic.BaseModel):
 def main(
     args: Args,
 ):
+    # Replace the uvx-subprocess HF downloader with the Python API before
+    # Inference.__init__ triggers it. Each uvx call costs 5-7s in process
+    # startup + HF CLI network verification even on cache hits.
+    from cosmos_predict2._src.imaginaire.utils import checkpoint_db
+    checkpoint_db._hf_download = _fast_hf_download
+
     paig_maker = PAIGEvalMaker()
-    if args.overrides.seed is not None:
-        seed = args.overrides.seed
-    else:
-        seed = 0
+    seed = args.overrides.seed if args.overrides.seed is not None else 0
     input_files = paig_maker.get_cosmos_predict_json_files(args.input_indices, seed)
-    inference_samples = InferenceArguments.from_files(input_files, overrides=args.overrides, setup_args=args.setup)
-    init_output_dir(args.setup.output_dir, profile=args.setup.profile)
 
-    from cosmos_predict2.inference import Inference
+    try:
+        inference_samples = InferenceArguments.from_files(input_files, overrides=args.overrides, setup_args=args.setup)
+        init_output_dir(args.setup.output_dir, profile=args.setup.profile)
 
-    inference = Inference(args.setup)
-    inference.generate(inference_samples, output_dir=args.setup.output_dir)
+        from cosmos_predict2.inference import Inference
+
+        inference = Inference(args.setup)
+
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        inference.generate(inference_samples, output_dir=args.setup.output_dir)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter()
+
+        # Only Rank 0 processes and prints the metrics to avoid terminal spam
+        if is_rank0():
+            total_time = end_time - start_time
+            num_samples = len(inference_samples)
+            avg_time = total_time / num_samples if num_samples > 0 else 0
+            
+            peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            reserved_vram_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
+
+            # Print to console
+            print("\n" + "="*40)
+            print("🚀 INFERENCE BENCHMARK RESULTS")
+            print("="*40)
+            print(f"Total Time ({num_samples} videos) : {total_time:.2f} seconds")
+            print(f"Average Time per Video  : {avg_time:.2f} seconds")
+            print(f"Peak VRAM Allocated     : {peak_vram_gb:.2f} GB")
+            print(f"Total VRAM Reserved     : {reserved_vram_gb:.2f} GB")
+            print("="*40 + "\n")
+
+            json_path = args.setup.output_dir / "benchmark_metrics.json"
+            
+            with open(json_path, mode='w') as f:
+                json.dump({
+                    "model": args.setup.model,
+                    "world_size": os.environ.get("WORLD_SIZE", "1"),
+                    "num_samples": num_samples,
+                    "total_time": total_time,
+                    "avg_time": avg_time,
+                    "peak_vram_gb": peak_vram_gb,
+                    "reserved_vram_gb": reserved_vram_gb,
+                    "input_indices": args.input_indices
+                }, f, indent=4)
+    finally:
+        paig_maker.cleanup()
 
 
 if __name__ == "__main__":
@@ -173,10 +326,10 @@ if __name__ == "__main__":
     see https://github.com/chengjunyan1/cosmos-predict2.5/blob/main/docs/inference.md, major difference is -i option is now pai bench indices
 
     Example usage:
-    python examples/inference_pai.py -i 123 -o outputs/pai_eval_output/test 
-    python examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test 
+    python examples/inference_pai.py -i 0 -o outputs/pai_eval_output/test
+    python examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test
     python examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
-    
+
     for multi-gpu, use torchrun:
     torchrun --nproc_per_node=8 examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
     """
