@@ -144,7 +144,7 @@ class PAIGEvalMaker:
             snapshot_download(
                 repo_id="shi-labs/physical-ai-bench-generation",
                 repo_type="dataset",
-                allow_patterns="condition_image/*",
+                allow_patterns=["condition_image/*", "cosmos_predict2_bench_full_info.json"],
                 local_dir=self.cache_dir
             )
             self.ds = load_dataset("shi-labs/physical-ai-bench-generation")
