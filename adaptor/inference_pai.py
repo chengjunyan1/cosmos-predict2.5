@@ -307,12 +307,12 @@ if __name__ == "__main__":
     see https://github.com/chengjunyan1/cosmos-predict2.5/blob/main/docs/inference.md, major difference is -i option is now pai bench indices
 
     Example usage:
-    python examples/inference_pai.py -i 0 -o outputs/pai_eval_output/test
-    python examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test
-    python examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
+    python adaptor/inference_pai.py -i 0 -o outputs/pai_eval_output/test
+    python adaptor/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test
+    python adaptor/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
 
     for multi-gpu, use torchrun:
-    torchrun --nproc_per_node=8 examples/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
+    torchrun --nproc_per_node=8 adaptor/inference_pai.py -i 0 1 2 -o outputs/pai_eval_output/test --model 2B/post-trained --seed 42
     """
     init_environment()
 
