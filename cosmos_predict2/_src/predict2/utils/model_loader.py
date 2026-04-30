@@ -82,7 +82,7 @@ def load_model_from_checkpoint(
     """
     if experiment_opts is None:
         experiment_opts = []
-    config_module = get_config_module(config_file)
+    config_module = get_config_module(config_file) # model loader
     config = importlib.import_module(config_module).make_config()
     config = override(config, ["--", f"experiment={experiment_name}"] + experiment_opts)
 

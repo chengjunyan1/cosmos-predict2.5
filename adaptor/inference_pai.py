@@ -28,6 +28,7 @@ import pydantic
 import tyro
 from cosmos_oss.init import cleanup_environment, init_environment, init_output_dir
 import torch.distributed as dist
+from adaptor.inference import inference
 
 from cosmos_predict2.config import (
     InferenceArguments,
@@ -249,55 +250,7 @@ def main(
     input_files = paig_maker.get_cosmos_predict_json_files(args.input_indices, seed)
 
     try:
-        inference_samples = InferenceArguments.from_files(input_files, overrides=args.overrides, setup_args=args.setup)
-        init_output_dir(args.setup.output_dir, profile=args.setup.profile)
-
-        from cosmos_predict2.inference import Inference
-
-        inference = Inference(args.setup)
-
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        start_time = time.perf_counter()
-
-        inference.generate(inference_samples, output_dir=args.setup.output_dir)
-
-        torch.cuda.synchronize()
-        end_time = time.perf_counter()
-
-        # Only Rank 0 processes and prints the metrics to avoid terminal spam
-        if is_rank0():
-            total_time = end_time - start_time
-            num_samples = len(inference_samples)
-            avg_time = total_time / num_samples if num_samples > 0 else 0
-            
-            peak_vram_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            reserved_vram_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
-
-            # Print to console
-            print("\n" + "="*40)
-            print("🚀 INFERENCE BENCHMARK RESULTS")
-            print("="*40)
-            print(f"Total Time ({num_samples} videos) : {total_time:.2f} seconds")
-            print(f"Average Time per Video  : {avg_time:.2f} seconds")
-            print(f"Peak VRAM Allocated     : {peak_vram_gb:.2f} GB")
-            print(f"Total VRAM Reserved     : {reserved_vram_gb:.2f} GB")
-            print("="*40 + "\n")
-
-            json_path = args.setup.output_dir / "benchmark_metrics.json"
-            
-            with open(json_path, mode='w') as f:
-                json.dump({
-                    "model": args.setup.model,
-                    "world_size": os.environ.get("WORLD_SIZE", "1"),
-                    "num_samples": num_samples,
-                    "total_time": total_time,
-                    "avg_time": avg_time,
-                    "peak_vram_gb": peak_vram_gb,
-                    "reserved_vram_gb": reserved_vram_gb,
-                    "input_indices": args.input_indices
-                }, f, indent=4)
+        inference(input_files=input_files, setup=args.setup, overrides=args.overrides)
     finally:
         paig_maker.cleanup()
 
